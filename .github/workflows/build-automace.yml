@@ -1,0 +1,40 @@
+name: build-automace
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'automace/**'
+      - '.github/workflows/build-automace.yml'
+  pull_request:
+    paths:
+      - 'automace/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Gradle is installed by the action, so no wrapper is needed
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+          build-root-directory: automace
+
+      - name: Build
+        working-directory: automace
+        run: gradle build --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: automace-jar
+          path: |
+            automace/build/libs/*.jar
+            !automace/build/libs/*-sources.jar

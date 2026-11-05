@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "automace",
+  "version": "${version}",
+  "name": "AutoMace",
+  "description": "Auto mace smash attack",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.automace.AutoMaceMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
