@@ -29,12 +29,14 @@ import java.util.Random;
 public class AutoMaceMod implements ClientModInitializer {
 
     // ---------------- settings ----------------
-    private static final double  SEARCH_RANGE  = 8.0;
-    private static final float   AIM_CONE      = 40f;   // target must be inside this view cone
-    private static final float   ATTACK_CONE   = 9f;    // allowed aim error to attack
-    private static final boolean AIM_ASSIST    = true;  // false = never rotates the camera
-    private static final boolean ALLOW_ELYTRA  = true;
-    private static final boolean SWAP_BACK     = true;
+    private static final double  TRACK_RANGE        = 14.0;  // how far we look for a target while falling
+    private static final double  AIM_RANGE          = 9.0;   // camera assist only starts inside this distance
+    private static final float   AIM_CONE           = 75f;   // targets farther than reach must be inside this view cone
+    private static final boolean AIM_ASSIST        = true;  // false = never rotates the camera
+    private static final boolean ALLOW_ELYTRA      = true;
+    private static final boolean SWAP_BACK         = true;  // return to the old slot AFTER landing
+    private static final boolean REQUIRE_SMASH_FALL = true; // false = hit any airborne target that is in reach
+    private static final float   MIN_CHARGE        = 0.55f; // lowest attack charge we accept when the window is closing
 
     private final Random rng = new Random();
     private KeyBinding toggleKey;
@@ -46,7 +48,7 @@ public class AutoMaceMod implements ClientModInitializer {
     private double minFall, reachLimit;
     private float cooldownNeed, aimSpeed;
     private int hesitate;
-    private int swapWait = -1, attackWait = -1;
+    private int swapWait = -1, attackWait = -1, windowTicks, missTicks;
     private long lastSwapTick = -100;
     private int swapExtra = 2;
     private int prevSlot = -1, returnTimer = -1;
@@ -77,7 +79,7 @@ public class AutoMaceMod implements ClientModInitializer {
         if (p == null || mc.world == null || mc.interactionManager == null) return;
         tickCount++;
 
-        // swap back to the previous slot (with a human-like delay)
+        // swap back to the previous slot after landing (with a human-like delay)
         if (returnTimer > 0 && --returnTimer == 0) {
             if (prevSlot >= 0 && prevSlot < 9) p.getInventory().setSelectedSlot(prevSlot);
             prevSlot = -1;
@@ -88,7 +90,13 @@ public class AutoMaceMod implements ClientModInitializer {
 
         boolean grounded = p.isOnGround() || p.isTouchingWater() || p.isInLava()
                 || p.hasVehicle() || p.getAbilities().flying || p.isClimbing();
-        if (grounded) { endFall(); return; }
+        if (grounded) {
+            if (airborne && SWAP_BACK && prevSlot != -1 && returnTimer < 0) {
+                returnTimer = 12 + rng.nextInt(24);
+            }
+            endFall();
+            return;
+        }
 
         if (!airborne) startFall();
 
@@ -96,36 +104,45 @@ public class AutoMaceMod implements ClientModInitializer {
         if (gliding && !ALLOW_ELYTRA) return;
 
         double fall = p.fallDistance;
+        Vec3d vel = p.getVelocity();
 
-        // fallDistance resets to 0 after an attack -> new fall
-        if (attackedThisFall && fall < 0.5) startFall();
-        if (attackedThisFall) { decayAim(); return; }
+        // after a hit the server resets fall distance (the client does not know) ->
+        // wait for a new fall, e.g. when we get launched upwards again
+        if (attackedThisFall) {
+            if (vel.y > 0.1) startFall(); else { decayAim(); return; }
+        }
 
-        boolean diving = p.getVelocity().y < (gliding ? -0.5 : -0.15);
-        if (!diving || fall < minFall - 1.0) { decayAim(); return; }
+        boolean falling = vel.y < (gliding ? -0.4 : -0.1);
+        if (!falling) { decayAim(); windowTicks = 0; return; }
 
         target = pickTarget(mc, p, target);
-        if (target == null) { swapWait = attackWait = -1; decayAim(); return; }
+        if (target == null) { swapWait = attackWait = -1; windowTicks = 0; decayAim(); return; }
 
         if (++offsetAge > 20 + rng.nextInt(25)) rollOffset();
         updateWander();
-        Vec3d aim = aimPoint(target);
-        double reach = reachDist(p, target);
-        float err = coneAngle(p, aim);
 
-        // ---- 1) pick and swap to the best mace ----
+        Box box = target.getBoundingBox();
+        Vec3d eye = p.getEyePos();
+        double reachNow  = reachFrom(eye, box);
+        double reachNext = reachFrom(new Vec3d(eye.x + vel.x, eye.y + vel.y, eye.z + vel.z), box);
+        boolean inReach = reachNow <= reachLimit;
+
+        // ---- 1) pick the best mace and swap EARLY ----
+        // (switching items resets the attack cooldown and the mace cooldown is long,
+        //  so the swap has to happen at the start of the dive, not at the last moment)
         int cur = p.getInventory().getSelectedSlot();
-        int best = bestMaceSlot(p, target, Math.max(fall, 3.0));
+        double estFall = Math.max(fall, 3.0);
+        int best = bestMaceSlot(p, target, estFall);
         if (best == -1) return;
 
         boolean needSwap = cur != best;
         if (needSwap && p.getInventory().getStack(cur).isOf(Items.MACE)) {
-            double sc = score(p.getInventory().getStack(cur), Math.max(fall, 3.0), target);
-            double sb = score(p.getInventory().getStack(best), Math.max(fall, 3.0), target);
+            double sc = score(p.getInventory().getStack(cur), estFall, target);
+            double sb = score(p.getInventory().getStack(best), estFall, target);
             needSwap = sb > sc * 1.08;   // only swap if it is clearly better
         }
-        if (needSwap && reach < SEARCH_RANGE) {
-            if (swapWait < 0) swapWait = gaussTicks(3.5, 1.2, 1, 8);
+        if (needSwap) {
+            if (swapWait < 0) swapWait = gaussTicks(3.0, 1.2, 1, 7);
             if (swapWait > 0) {
                 swapWait--;
             } else {
@@ -137,42 +154,58 @@ public class AutoMaceMod implements ClientModInitializer {
             }
         }
 
-        // ---- 2) aiming ----
-        if (AIM_ASSIST) aimStep(mc, p, aim); else decayAim();
+        // ---- 2) aiming (only when the target is close) ----
+        Vec3d aim = aimPoint(target);
+        if (AIM_ASSIST && reachNow < AIM_RANGE) aimStep(mc, p, aim, reachNow); else decayAim();
 
-        // ---- 3) attack conditions ----
+        // ---- 3) attack: if the target is in reach and under the crosshair, hit it ----
         boolean holdingMace = p.getInventory().getStack(p.getInventory().getSelectedSlot()).isOf(Items.MACE);
-        boolean onTarget = AIM_ASSIST ? err <= ATTACK_CONE : mc.targetedEntity == target;
+        boolean smashOk = !REQUIRE_SMASH_FALL || fall >= minFall;
+
+        if (inReach) windowTicks++; else windowTicks = 0;
+        boolean rayHit = lookHits(p, box, reachLimit + 0.15);
+
+        // the longer the target stays in reach, the less charge we insist on
+        float need = Math.max(MIN_CHARGE, cooldownNeed - 0.07f * windowTicks);
 
         boolean ready = holdingMace
-                && fall >= minFall
-                && reach <= reachLimit
-                && onTarget
-                && p.getAttackCooldownProgress(0.5f) >= cooldownNeed
+                && smashOk
+                && inReach
+                && rayHit
+                && p.getAttackCooldownProgress(0.5f) >= need
                 && tickCount - lastSwapTick >= swapExtra;
 
-        if (!ready) { attackWait = -1; return; }
+        if (!ready) {
+            // do not reset the reaction timer on a single flicker
+            if (++missTicks >= 3) attackWait = -1;
+            return;
+        }
+        missTicks = 0;
 
-        if (attackWait < 0) { attackWait = gaussTicks(3.8, 1.4, 2, 9) + hesitate; hesitate = 0; }
+        // short human reaction (0 to 3 ticks), the window while falling is only 2-3 ticks long
+        if (attackWait < 0) { attackWait = gaussTicks(1.2, 0.9, 0, 3) + hesitate; hesitate = 0; }
+        // about to leave reach next tick -> last chance, click now
+        if (reachNext > reachLimit + 0.15) attackWait = 0;
         if (attackWait > 0) { attackWait--; return; }
 
         mc.interactionManager.attackEntity(p, target);
         p.swingHand(Hand.MAIN_HAND);
         attackedThisFall = true;
         attackWait = -1;
-        if (SWAP_BACK && prevSlot != -1) returnTimer = 4 + rng.nextInt(9);
     }
 
     // ================= fall management =================
     private void startFall() {
         airborne = true;
         attackedThisFall = false;
-        minFall      = 2.6 + rng.nextDouble() * 1.4;    // 2.6 to 4.0 blocks
-        reachLimit   = 2.6 + rng.nextDouble() * 0.3;
-        cooldownNeed = 0.9f + rng.nextFloat() * 0.1f;
-        aimSpeed     = 0.16f + rng.nextFloat() * 0.14f;
-        hesitate     = rng.nextInt(100) < 6 ? 5 + rng.nextInt(8) : 0;
+        returnTimer = -1;                                 // keep the mace in hand while we keep jumping
+        minFall      = 1.7 + rng.nextDouble() * 0.8;      // smash needs > 1.5 blocks
+        reachLimit   = 2.8 + rng.nextDouble() * 0.2;      // 2.8 to 3.0 blocks
+        cooldownNeed = 0.85f + rng.nextFloat() * 0.15f;
+        aimSpeed     = 0.22f + rng.nextFloat() * 0.16f;
+        hesitate     = rng.nextInt(100) < 5 ? 2 + rng.nextInt(2) : 0;
         swapWait = attackWait = -1;
+        windowTicks = missTicks = 0;
         rollOffset();
     }
 
@@ -181,6 +214,7 @@ public class AutoMaceMod implements ClientModInitializer {
         attackedThisFall = false;
         target = null;
         swapWait = attackWait = -1;
+        windowTicks = missTicks = 0;
         yawVel = pitchVel = 0;
     }
 
@@ -227,19 +261,21 @@ public class AutoMaceMod implements ClientModInitializer {
     }
 
     // ================= targeting =================
+    /** Players inside reach win; otherwise the closest one near the view direction. */
     private PlayerEntity pickTarget(MinecraftClient mc, ClientPlayerEntity p, PlayerEntity current) {
-        if (current != null && current.isAlive() && p.canSee(current)
-                && p.distanceTo(current) < SEARCH_RANGE + 2
-                && coneAngle(p, current.getBoundingBox().getCenter()) < AIM_CONE * 1.3f) {
-            return current; // stay loyal to the previous target
-        }
         PlayerEntity best = null;
-        float bestAng = AIM_CONE;
+        double bestScore = Double.MAX_VALUE;
         for (PlayerEntity e : mc.world.getPlayers()) {
             if (e == p || !e.isAlive() || e.isSpectator()) continue;
-            if (p.distanceTo(e) > SEARCH_RANGE || !p.canSee(e)) continue;
-            float a = coneAngle(p, e.getBoundingBox().getCenter());
-            if (a < bestAng) { bestAng = a; best = e; }
+            double d = reachFrom(p.getEyePos(), e.getBoundingBox());
+            if (d > TRACK_RANGE || !p.canSee(e)) continue;
+            float ang = coneAngle(p, e.getBoundingBox().getCenter());
+            boolean close = d <= reachLimit + 0.5;
+            if (ang > AIM_CONE && !close) continue;
+            double s = d + ang * 0.05;
+            if (e == current) s -= 1.0;   // stay loyal to the previous target
+            if (close) s -= 3.0;          // somebody we can actually hit has priority
+            if (s < bestScore) { bestScore = s; best = e; }
         }
         return best;
     }
@@ -266,9 +302,8 @@ public class AutoMaceMod implements ClientModInitializer {
                 b.getCenter().z + offZ * w + wanderZ);
     }
 
-    private double reachDist(ClientPlayerEntity p, PlayerEntity t) {
-        Vec3d eye = p.getEyePos();
-        Box b = t.getBoundingBox();
+    /** Distance from an eye position to the closest point of a hitbox. */
+    private double reachFrom(Vec3d eye, Box b) {
         Vec3d c = new Vec3d(
                 MathHelper.clamp(eye.x, b.minX, b.maxX),
                 MathHelper.clamp(eye.y, b.minY, b.maxY),
@@ -276,14 +311,37 @@ public class AutoMaceMod implements ClientModInitializer {
         return eye.distanceTo(c);
     }
 
+    /** True when the crosshair ray hits the (slightly padded) hitbox within the given length. */
+    private boolean lookHits(ClientPlayerEntity p, Box b, double reach) {
+        Vec3d o = p.getEyePos();
+        Vec3d d = p.getRotationVec(1.0f);
+        double m = 0.12;
+        double[] oo = {o.x, o.y, o.z};
+        double[] dd = {d.x, d.y, d.z};
+        double[] lo = {b.minX - m, b.minY - m, b.minZ - m};
+        double[] hi = {b.maxX + m, b.maxY + m, b.maxZ + m};
+        double tmin = 0.0, tmax = reach;
+        for (int i = 0; i < 3; i++) {
+            if (Math.abs(dd[i]) < 1.0e-9) {
+                if (oo[i] < lo[i] || oo[i] > hi[i]) return false;
+            } else {
+                double t1 = (lo[i] - oo[i]) / dd[i];
+                double t2 = (hi[i] - oo[i]) / dd[i];
+                if (t1 > t2) { double t = t1; t1 = t2; t2 = t; }
+                tmin = Math.max(tmin, t1);
+                tmax = Math.min(tmax, t2);
+                if (tmin > tmax) return false;
+            }
+        }
+        return true;
+    }
+
     // ================= rotation =================
-    private float yawTo(ClientPlayerEntity p, Vec3d pt) {
-        Vec3d e = p.getEyePos();
+    private float yawFrom(Vec3d e, Vec3d pt) {
         return (float) (MathHelper.atan2(pt.z - e.z, pt.x - e.x) * 180.0 / Math.PI) - 90f;
     }
 
-    private float pitchTo(ClientPlayerEntity p, Vec3d pt) {
-        Vec3d e = p.getEyePos();
+    private float pitchFrom(Vec3d e, Vec3d pt) {
         return (float) -(MathHelper.atan2(pt.y - e.y, Math.hypot(pt.x - e.x, pt.z - e.z)) * 180.0 / Math.PI);
     }
 
@@ -293,21 +351,28 @@ public class AutoMaceMod implements ClientModInitializer {
         return (float) Math.toDegrees(Math.acos(MathHelper.clamp(look.dotProduct(dir), -1.0, 1.0)));
     }
 
-    private void aimStep(MinecraftClient mc, ClientPlayerEntity p, Vec3d pt) {
-        float dYaw = MathHelper.wrapDegrees(yawTo(p, pt) - p.getYaw());
-        float dPitch = pitchTo(p, pt) - p.getPitch();
+    private void aimStep(MinecraftClient mc, ClientPlayerEntity p, Vec3d pt, double reachNow) {
+        // aim from where we will be next tick, because we are falling fast
+        Vec3d v = p.getVelocity();
+        Vec3d e0 = p.getEyePos();
+        Vec3d eye = new Vec3d(e0.x + v.x, e0.y + v.y, e0.z + v.z);
+
+        float dYaw = MathHelper.wrapDegrees(yawFrom(eye, pt) - p.getYaw());
+        float dPitch = pitchFrom(eye, pt) - p.getPitch();
 
         // close enough: stop moving, like a real mouse
         if (Math.abs(dYaw) < 0.4f && Math.abs(dPitch) < 0.4f) { decayAim(); return; }
 
-        float wantYaw = dYaw * aimSpeed;
-        float wantPitch = dPitch * aimSpeed * 0.75f;      // pitch is slower than yaw
+        // the closer the target, the faster the hand moves (1.0 to 2.0)
+        float urgency = reachNow < 6.0 ? 1.0f + (float) ((6.0 - reachNow) / 6.0) : 1.0f;
+        float wantYaw = dYaw * aimSpeed * urgency;
+        float wantPitch = dPitch * aimSpeed * 0.85f * urgency;   // pitch is a bit slower than yaw
 
         // inertia + noise => soft start, acceleration, slight overshoot
-        yawVel   = yawVel   * 0.55f + wantYaw   * 0.45f + (float) rng.nextGaussian() * 0.12f;
-        pitchVel = pitchVel * 0.55f + wantPitch * 0.45f + (float) rng.nextGaussian() * 0.09f;
-        yawVel   = MathHelper.clamp(yawVel,   -12f, 12f);
-        pitchVel = MathHelper.clamp(pitchVel, -9f,  9f);
+        yawVel   = yawVel   * 0.45f + wantYaw   * 0.55f + (float) rng.nextGaussian() * 0.12f;
+        pitchVel = pitchVel * 0.45f + wantPitch * 0.55f + (float) rng.nextGaussian() * 0.09f;
+        yawVel   = MathHelper.clamp(yawVel,   -22f, 22f);
+        pitchVel = MathHelper.clamp(pitchVel, -18f, 18f);
 
         // quantise to the mouse step (GCD) and carry the remainder
         double f = mc.options.getMouseSensitivity().getValue() * 0.6 + 0.2;
